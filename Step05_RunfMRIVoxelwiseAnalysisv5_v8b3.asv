@@ -1,0 +1,131 @@
+% compared to v4, signal percentage change is used for analysis instead of
+% zscore.
+% compared to v8b1, low pass 0.1 hz is applied, even FD<1mm volumes less than 100
+% timepoints we still keep it.
+% differet from v8b2, zscore(time seires) instead of percentage is used.
+clear
+clc
+close all
+datadir = 'U:\RF1\data';%'\\research2new\J\RF1\data';
+olddatadir = 'S:\'; % path for eprime file.
+subject_key = '10*'; % all subjects from RF1 and SEWRAD
+sublist = dir([datadir,'/',subject_key]);
+if strcmpi(subject_key,'*')
+    sublist = sublist(3:end);
+end
+for s = numel(sublist):-1:1
+    if numel(strfind(sublist(s).name,'KMA'))>0
+        sublist(s) = [];
+    end
+end
+% sublist = sublist(1:37);
+FD_thresh=1;
+MNI_mask = load_untouch_nii('MNI152_T1_2mm_brain_mask_dil.nii.gz');MNI_mask = MNI_mask.img;
+
+%% run analysis
+for s = 1:numel(sublist) 
+    subID = sublist(s).name;
+    fMRI_ensemble = [];
+    X_ensemble = [];fMRImask=[];
+    save_dir = [datadir,'/',subID,'/Analysis/']
+    if strcmpi(subID(1:2),'10')
+        cohort = 'RF1';TR=1.53;
+    elseif strcmpi(subID(1:2),'SE')
+        cohort = 'SEWRAD';TR=1.485;
+    end
+    version_tag = 'v08b3';
+    [X_transform,design_mat_version,contrast,t_useind_all,regressors_name] = RF1_GLMdesign_version(version_tag,cohort);
+    if exist([save_dir,version_tag,'Cor.nii.gz'],'file')
+        continue;
+    end
+    t_useind_set = cell(3,1);first_fMRI_flag=0;
+    for sess = 1:3
+        fMRIkey = 'MNI_*s4*.nii';
+        fMRIdir= [datadir,'/',subID,'/7T_study',subID(1:5),'/nifti1/'];
+        fMRIlist = dir([fMRIdir,'*FMRI',num2str(sess),'*\',fMRIkey]);
+%         if isempty(fMRIlist)
+%             fMRIlist = dir(['E:\RF1\',subID,'\Image\*FMRI',num2str(sess),'*\',fMRIkey]);
+%         end
+        if numel(fMRIlist)>400
+            fMRI4Dpath = fMRIlist(1).folder;
+        end
+        if strcmpi(cohort,'RF1')
+            t_uselabel = zeros(510,1);
+        else
+            t_uselabel = zeros(524,1);
+        end
+        t_uselabel(t_useind_all) = 1;
+        fMRISession =  ['FMRI',num2str(sess)];
+        try
+            design_list = dir([datadir,'/',subID,'/eprime/*scan*/X_run',num2str(sess),'_canonical_hrf_',design_mat_version,'.mat']);
+        if numel(design_list)~=1
+            continue;
+        end
+
+        fMRI_dir = [datadir,'/',subID,'/Analysis/fMRI_ROI.mat'];
+        if ~exist(fMRI_dir,'file')
+            continue;
+        end
+        load(fMRI_dir,'atlas_struct');
+        if ~isfield(atlas_struct,fMRISession)
+            continue;
+        end
+
+        [motion_FD,motion_rms,abs_tran,abs_rot] = ZY_motion_FDandRMS(atlas_struct.(fMRISession).Affine);
+        if mean(motion_FD)>=3
+            continue;
+        else
+            exclude_ind = motion_FD>=FD_thresh;
+            exclude_ind = exclude_ind + [0;exclude_ind(1:end-1)] + [exclude_ind(2:end);0];
+            exclude_ind = exclude_ind(1:numel(t_uselabel));
+            t_useind = find(exclude_ind==0 & t_uselabel>0);
+%             if numel(t_useind) < 100
+%                 continue;
+%             end
+        end
+
+        design_dir = [design_list(1).folder,'/',design_list(1).name];
+        load(design_dir,'X','ref_TR');
+        X = X/50;
+        custom_X = X;
+        t_dim = size(atlas_struct.(fMRISession).WMcomp,1);
+        nuisance_regressors = [(1:t_dim)',ZY_motion_regressMotionParam(atlas_struct.(fMRISession).Affine,12),...
+            atlas_struct.(fMRISession).WMcomp(:,1:3),atlas_struct.(fMRISession).CSFcomp(:,1:3)];%,atlas_struct.(fMRISession).GSTS
+
+        fMRI4Dpath
+        fMRInii = ZY_fmrimerge([fMRI4Dpath,'/',fMRIkey]);
+        fMRInii_1st  = squeeze(fMRInii(1,:,:,:));
+        fMRInii_std = squeeze(std(fMRInii,[],1));
+
+        if first_fMRI_flag==0 || isempty(fMRImask)
+            fMRImask = squeeze(fMRInii_1st)>=mean(fMRInii_1st(:));
+            fMRImask = fMRInii_std>0 & MNI_mask>0 & fMRImask>0;
+            first_fMRI_flag=1;
+        end
+
+        TS_final = function_RegressSignalOut(zscore(nuisance_regressors(t_useind,:)),fMRInii(t_useind,fMRImask>0));
+        TS_final = function_detrend_LPF_motion(TS_final,TR,0,1,0,0.1,4); %v8b2
+%         TS_final = zscore(TS_final);
+        TS_final = 100*(TS_final - mean(TS_final))./mean(TS_final);
+        fMRI_ensemble = [fMRI_ensemble;TS_final];
+        X_ensemble = [X_ensemble;custom_X(t_useind,:)*X_transform];
+        t_useind_set{sess} = t_useind;
+    end
+    savefMRI_dir = [save_dir,'/fMRIdata.mat'];
+    if exist(savefMRI_dir,'file')==0
+        save(savefMRI_dir,'fMRI_ensemble','X_ensemble','t_useind_set','-v7.3');
+    end
+    if ~isempty(fMRI_ensemble)
+        [Cor,Beta,p_fstat,Const,Res,Rest] = Univaranalysisv2(X_ensemble,...
+            zscore(fMRI_ensemble),fMRImask,contrast,1,0);
+
+        ZY_savenii(Beta,[save_dir,version_tag,'Beta.nii.gz']);
+        ZY_savenii(Cor,[save_dir,version_tag,'Cor.nii.gz']);
+        ZY_savenii(Const,[save_dir,version_tag,'Const.nii.gz']);
+%         log10p = -log10(p_fstat);
+%         log10p(p_fstat==0) = 0;
+%         ZY_savenii(-log10(p_fstat),[save_dir,version_tag,'pval.nii.gz']);
+    end
+end
+RunfMRIVoxelWiseAnalysis_post(version_tag,subject_key,regressors_name,1);
+RunfMRIVoxelWiseAnalysis_Association_post(version_tag, subject_key)
